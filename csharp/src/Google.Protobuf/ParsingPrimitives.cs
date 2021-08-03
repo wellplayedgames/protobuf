@@ -380,15 +380,33 @@ namespace Google.Protobuf
         /// </summary>
         public static double ParseDouble(ref ReadOnlySpan<byte> buffer, ref ParserInternalState state)
         {
-            const int length = sizeof(double);
-            if (!BitConverter.IsLittleEndian || state.bufferPos + length > state.bufferSize)
+            if (state.bufferPos + 8 <= state.bufferSize)
+            {
+                if (BitConverter.IsLittleEndian)
+                {
+                    var result = BitConverter.ToDouble(buffer.ToArray(), state.bufferPos);
+                    state.bufferPos += 8;
+                    return result;
+                }
+                else
+                {
+                    var bytes = new byte[8];
+                    bytes[0] = buffer[state.bufferPos + 7];
+                    bytes[1] = buffer[state.bufferPos + 6];
+                    bytes[2] = buffer[state.bufferPos + 5];
+                    bytes[3] = buffer[state.bufferPos + 4];
+                    bytes[4] = buffer[state.bufferPos + 3];
+                    bytes[5] = buffer[state.bufferPos + 2];
+                    bytes[6] = buffer[state.bufferPos + 1];
+                    bytes[7] = buffer[state.bufferPos];
+                    state.bufferPos += 8;
+                    return BitConverter.ToDouble(bytes, 0);
+                }
+            }
+            else
             {
                 return BitConverter.Int64BitsToDouble((long)ParseRawLittleEndian64(ref buffer, ref state));
             }
-            // ReadUnaligned uses processor architecture for endianness.
-            double result = Unsafe.ReadUnaligned<double>(ref MemoryMarshal.GetReference(buffer.Slice(state.bufferPos, length)));
-            state.bufferPos += length;
-            return result;
         }
 
         /// <summary>
@@ -396,33 +414,21 @@ namespace Google.Protobuf
         /// </summary>
         public static float ParseFloat(ref ReadOnlySpan<byte> buffer, ref ParserInternalState state)
         {
-            const int length = sizeof(float);
-            if (!BitConverter.IsLittleEndian || state.bufferPos + length > state.bufferSize)
+            if (BitConverter.IsLittleEndian && 4 <= state.bufferSize - state.bufferPos)
             {
-                return ParseFloatSlow(ref buffer, ref state);
+                float ret = BitConverter.ToSingle(buffer.ToArray(), state.bufferPos);
+                state.bufferPos += 4;
+                return ret;
             }
-            // ReadUnaligned uses processor architecture for endianness.
-            float result = Unsafe.ReadUnaligned<float>(ref MemoryMarshal.GetReference(buffer.Slice(state.bufferPos, length)));
-            state.bufferPos += length;
-            return result;  
-        }
-
-        private static unsafe float ParseFloatSlow(ref ReadOnlySpan<byte> buffer, ref ParserInternalState state)
-        {
-            const int length = sizeof(float);
-            byte* stackBuffer = stackalloc byte[length];
-            Span<byte> tempSpan = new Span<byte>(stackBuffer, length);
-            for (int i = 0; i < length; i++)
+            else
             {
-                tempSpan[i] = ReadRawByte(ref buffer, ref state);
-            }
-
-            // Content is little endian. Reverse if needed to match endianness of architecture.
-            if (!BitConverter.IsLittleEndian)
-            {
-                tempSpan.Reverse();
-            }
-            return Unsafe.ReadUnaligned<float>(ref MemoryMarshal.GetReference(tempSpan));
+                byte[] rawBytes = ReadRawBytes(ref buffer, ref state, 4);
+                if (!BitConverter.IsLittleEndian)
+                {
+                    ByteArray.Reverse(rawBytes);
+                }
+                return BitConverter.ToSingle(rawBytes, 0);
+            }  
         }
 
         /// <summary>

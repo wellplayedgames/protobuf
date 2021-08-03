@@ -70,44 +70,26 @@ namespace Google.Protobuf
         /// <summary>
         /// Writes a float field value, without a tag, to the stream.
         /// </summary>
-        public static unsafe void WriteFloat(ref Span<byte> buffer, ref WriterInternalState state, float value)
+        public static void WriteFloat(ref Span<byte> buffer, ref WriterInternalState state, float value)
         {
-            const int length = sizeof(float);
-            if (buffer.Length - state.position >= length)
+            // TODO: avoid allocating a byte array!!!
+            byte[] rawBytes = BitConverter.GetBytes(value);
+            if (!BitConverter.IsLittleEndian)
             {
-                // if there's enough space in the buffer, write the float directly into the buffer
-                var floatSpan = buffer.Slice(state.position, length);
-                Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(floatSpan), value);
+                ByteArray.Reverse(rawBytes);
+            }
 
-                if (!BitConverter.IsLittleEndian)
-                {
-                    floatSpan.Reverse();
-                }
-                state.position += length;
+            if (state.limit - state.position >= 4)
+            {
+                buffer[state.position++] = rawBytes[0];
+                buffer[state.position++] = rawBytes[1];
+                buffer[state.position++] = rawBytes[2];
+                buffer[state.position++] = rawBytes[3];
             }
             else
             {
-                WriteFloatSlowPath(ref buffer, ref state, value);
+                WriteRawBytes(ref buffer, ref state, rawBytes, 0, 4);
             }
-        }
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        private static unsafe void WriteFloatSlowPath(ref Span<byte> buffer, ref WriterInternalState state, float value)
-        {
-            const int length = sizeof(float);
-
-            // TODO(jtattermusch): deduplicate the code. Populating the span is the same as for the fastpath.
-            Span<byte> floatSpan = stackalloc byte[length];
-            Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(floatSpan), value);
-            if (!BitConverter.IsLittleEndian)
-            {
-                floatSpan.Reverse();
-            }
-
-            WriteRawByte(ref buffer, ref state, floatSpan[0]);
-            WriteRawByte(ref buffer, ref state, floatSpan[1]);
-            WriteRawByte(ref buffer, ref state, floatSpan[2]);
-            WriteRawByte(ref buffer, ref state, floatSpan[3]);
         }
 
         /// <summary>
@@ -195,7 +177,11 @@ namespace Google.Protobuf
             {
                 if (length == value.Length) // Must be all ASCII...
                 {
-                    WriteAsciiStringToBuffer(buffer, ref state, value, length);
+                    for (int i = 0; i < length; i++)
+                    {
+                        buffer[state.position + i] = (byte)value[i];
+                    }
+                    state.position += length;
                 }
                 else
                 {
@@ -210,104 +196,6 @@ namespace Google.Protobuf
                 // but more benchmarks would need to be added as evidence.
                 byte[] bytes = Utf8Encoding.GetBytes(value);
                 WriteRawBytes(ref buffer, ref state, bytes);
-            }
-        }
-
-        // Calling this method with non-ASCII content will break.
-        // Content must be verified to be all ASCII before using this method.
-        private static void WriteAsciiStringToBuffer(Span<byte> buffer, ref WriterInternalState state, string value, int length)
-        {
-            ref char sourceChars = ref MemoryMarshal.GetReference(value.AsSpan());
-            ref byte destinationBytes = ref MemoryMarshal.GetReference(buffer.Slice(state.position));
-
-            int currentIndex = 0;
-            // If 64bit, process 4 chars at a time.
-            // The logic inside this check will be elided by JIT in 32bit programs.
-            if (IntPtr.Size == 8)
-            {
-                // Need at least 4 chars available to use this optimization. 
-                if (length >= 4)
-                {
-                    ref byte sourceBytes = ref Unsafe.As<char, byte>(ref sourceChars);
-
-                    // Process 4 chars at a time until there are less than 4 remaining.
-                    // We already know all characters are ASCII so there is no need to validate the source.
-                    int lastIndexWhereCanReadFourChars = value.Length - 4;
-                    do
-                    {
-                        NarrowFourUtf16CharsToAsciiAndWriteToBuffer(
-                            ref Unsafe.AddByteOffset(ref destinationBytes, (IntPtr)currentIndex),
-                            Unsafe.ReadUnaligned<ulong>(ref Unsafe.AddByteOffset(ref sourceBytes, (IntPtr)(currentIndex * 2))));
-
-                    } while ((currentIndex += 4) <= lastIndexWhereCanReadFourChars);
-                }
-            }
-
-            // Process any remaining, 1 char at a time.
-            // Avoid bounds checking with ref + Unsafe
-            for (; currentIndex < length; currentIndex++)
-            {
-                Unsafe.AddByteOffset(ref destinationBytes, (IntPtr)currentIndex) = (byte)Unsafe.AddByteOffset(ref sourceChars, (IntPtr)(currentIndex * 2));
-            }
-
-            state.position += length;
-        }
-
-        // Copied with permission from https://github.com/dotnet/runtime/blob/1cdafd27e4afd2c916af5df949c13f8b373c4335/src/libraries/System.Private.CoreLib/src/System/Text/ASCIIUtility.cs#L1119-L1171
-        //
-        /// <summary>
-        /// Given a QWORD which represents a buffer of 4 ASCII chars in machine-endian order,
-        /// narrows each WORD to a BYTE, then writes the 4-byte result to the output buffer
-        /// also in machine-endian order.
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void NarrowFourUtf16CharsToAsciiAndWriteToBuffer(ref byte outputBuffer, ulong value)
-        {
-#if GOOGLE_PROTOBUF_SIMD
-            if (Sse2.X64.IsSupported)
-            {
-                // Narrows a vector of words [ w0 w1 w2 w3 ] to a vector of bytes
-                // [ b0 b1 b2 b3 b0 b1 b2 b3 ], then writes 4 bytes (32 bits) to the destination.
-
-                Vector128<short> vecWide = Sse2.X64.ConvertScalarToVector128UInt64(value).AsInt16();
-                Vector128<uint> vecNarrow = Sse2.PackUnsignedSaturate(vecWide, vecWide).AsUInt32();
-                Unsafe.WriteUnaligned<uint>(ref outputBuffer, Sse2.ConvertToUInt32(vecNarrow));
-            }
-            else if (AdvSimd.IsSupported)
-            {
-                // Narrows a vector of words [ w0 w1 w2 w3 ] to a vector of bytes
-                // [ b0 b1 b2 b3 * * * * ], then writes 4 bytes (32 bits) to the destination.
-
-                Vector128<short> vecWide = Vector128.CreateScalarUnsafe(value).AsInt16();
-                Vector64<byte> lower = AdvSimd.ExtractNarrowingSaturateUnsignedLower(vecWide);
-                Unsafe.WriteUnaligned<uint>(ref outputBuffer, lower.AsUInt32().ToScalar());
-            }
-            else
-#endif
-            {
-                // Fallback to non-SIMD approach when SIMD is not available.
-                // This could happen either because the APIs are not available, or hardware doesn't support it.
-                // Processing 4 chars at a time in this fallback is still faster than casting one char at a time.
-                if (BitConverter.IsLittleEndian)
-                {
-                    outputBuffer = (byte)value;
-                    value >>= 16;
-                    Unsafe.Add(ref outputBuffer, 1) = (byte)value;
-                    value >>= 16;
-                    Unsafe.Add(ref outputBuffer, 2) = (byte)value;
-                    value >>= 16;
-                    Unsafe.Add(ref outputBuffer, 3) = (byte)value;
-                }
-                else
-                {
-                    Unsafe.Add(ref outputBuffer, 3) = (byte)value;
-                    value >>= 16;
-                    Unsafe.Add(ref outputBuffer, 2) = (byte)value;
-                    value >>= 16;
-                    Unsafe.Add(ref outputBuffer, 1) = (byte)value;
-                    value >>= 16;
-                    outputBuffer = (byte)value;
-                }
             }
         }
 
